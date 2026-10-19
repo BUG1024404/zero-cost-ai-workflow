@@ -1,0 +1,1 @@
+{"author":"","dependencies":{"12306-mcp":"^0.3.10"},"description":"12306 ticket inquiry MCP server wrapper","keywords":[],"license":"MIT","main":"index.js","name":"zero-cost-12306-mcp","scripts":{"test":"echo \"Error: no test specified\" && exit 1"},"version":"1.0.0"}
