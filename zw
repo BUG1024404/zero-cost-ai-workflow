@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+zw — 零成本 AI 工作流一键包命令行工具 (v0.2)
+
+一条命令管全部：聊天、扫免费模型、换模型、体检、更新。
+所有输出均为简体中文。只用 Python 标准库，无第三方依赖。
+
+核心原则 fail-closed：任何模型 ID 必须以 :free 结尾且来自最新免费扫描，
+否则拒绝执行——想花钱都花不出去。
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "0.2.0"
+DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+DEFAULT_PROVIDER = "openrouter"
+REPO_URL = "https://github.com/BUG1024404/zero-cost-ai-workflow.git"
+
+# 模型 ID 必须形如 org/model:free（可含多级路径），绝不允许收费变体
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-/]*:free$")
+
+
+class FailClosedError(RuntimeError):
+    """fail-closed 拒绝：模型 ID 无法证明免费。"""
+
+
+# ---------- 路径 ----------
+def _home() -> Path:
+    return Path(os.path.expanduser("~"))
+
+
+def zw_home() -> Path:
+    return _home() / ".zw"
+
+
+def zw_conf() -> Path:
+    return _home() / ".config" / "zw"
+
+
+def pi_agent() -> Path:
+    return _home() / ".pi" / "agent"
+
+
+def key_file() -> Path:
+    return zw_conf() / ".openrouter_key"
+
+
+def settings_path() -> Path:
+    return pi_agent() / "settings.json"
+
+
+def auth_path() -> Path:
+    return pi_agent() / "auth.json"
+
+
+def scan_cache() -> Path:
+    return pi_agent() / "freetoken-bots.json"
+
+
+def install_conf() -> Path:
+    return zw_conf() / "install.conf"
+
+
+def minskill_radar() -> Path:
+    return _home() / "min-skill" / "skills" / "FreeToken-Bots" / "scripts" / "radar.py"
+
+
+# ---------- fail-closed 校验 ----------
+def is_free_id(mid) -> bool:
+    """严格校验：必须是 :free 结尾的合法模型 ID。"""
+    return isinstance(mid, str) and bool(MODEL_ID_RE.match(mid.strip()))
+
+
+def check_default_model(dm: str) -> str:
+    """校验 defaultModel：无 provider 前缀 + :free 结尾。"""
+    dm = (dm or "").strip()
+    if not is_free_id(dm):
+        raise FailClosedError(f"defaultModel 非法：{dm!r}（必须以 :free 结尾）")
+    if dm.startswith("openrouter/"):
+        raise FailClosedError(
+            "defaultModel 不能带 openrouter/ 前缀（会被 Pi 静默忽略并 fallback 到收费模型）"
+        )
+    return dm
+
+
+def build_settings(default_model: str = DEFAULT_MODEL, extra_free_ids=()) -> dict:
+    """生成 fail-closed 的 Pi settings.json 内容。"""
+    dm = check_default_model(default_model)
+    ids = {dm}
+    for m in extra_free_ids or ():
+        m = (m or "").strip()
+        if is_free_id(m) and not m.startswith("openrouter/"):
+            ids.add(m)
+    enabled = sorted("openrouter/" + m for m in ids)
+    return {
+        "defaultProvider": DEFAULT_PROVIDER,
+        "defaultModel": dm,
+        "enabledModels": enabled,
+    }
+
+
+def atomic_write_json(path: Path, data: dict):
+    """原子写 JSON，权限 600（凭据相关）或 644（普通配置）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_scan_free_ids():
+    """读扫描缓存的 free_ids（仅保留严格校验通过的 :free ID）。
+    返回 (ids, checked_at, excluded_count)。"""
+    p = scan_cache()
+    if not p.exists():
+        return [], None, 0
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        raw = d.get("free_ids", [])
+        ids = [m for m in raw if is_free_id(m)]
+        return ids, d.get("checked_at"), len(raw) - len(ids)
+    except (ValueError, KeyError, OSError):
+        return [], None, 0
+
+
+def read_settings():
+    p = settings_path()
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
+# ---------- 子命令 ----------
+def cmd_init(_args) -> int:
+    """生成 auth.json + settings.json（install.sh 调用，用户也可手动重跑）。"""
+    pa = pi_agent()
+    pa.mkdir(parents=True, exist_ok=True)
+    kf = key_file()
+    if not kf.exists():
+        print("❌ Key 文件不存在：~/.config/zw/.openrouter_key")
+        print("   请先运行 install.sh，或手动写入后 chmod 600。")
+        return 1
+    # 备份已有配置
+    for p in (auth_path(), settings_path()):
+        if p.exists():
+            bak = p.with_suffix(p.suffix + ".bak")
+            shutil.copy2(p, bak)
+            print(f"已备份 {p} -> {bak}")
+    auth = {"openrouter": {"type": "api_key", "key": "!cat ~/.config/zw/.openrouter_key"}}
+    atomic_write_json(auth_path(), auth)
+    os.chmod(auth_path(), 0o600)
+    atomic_write_json(settings_path(), build_settings())
+    os.chmod(settings_path(), 0o600)
+    print("✅ 已生成 Pi 配置（fail-closed：仅允许 :free 模型）")
+    print(f"   {auth_path()}")
+    print(f"   {settings_path()}")
+    return 0
+
+
+def _run_radar_scan():
+    """主路径：直接跑 radar.py scan。返回 (ok, report|errmsg)。"""
+    radar = minskill_radar()
+    if not radar.exists():
+        return False, "min-skill 未安装"
+    try:
+        r = subprocess.run(
+            [sys.executable, str(radar), "scan"],
+            cwd=str(radar.parent.parent),
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "scan 超时"
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "未知错误")[-500:]
+    try:
+        return True, json.loads(r.stdout)
+    except ValueError:
+        return False, "scan 输出不是合法 JSON"
+
+
+def _fallback_scan():
+    """兜底：curl 落盘 + 复用 radar.py 的过滤函数（绕过 urllib 大响应截断）。"""
+    radar = minskill_radar()
+    if not radar.exists():
+        return False, "min-skill 未安装，无法兜底"
+    tmp = Path("/tmp") / f"zw-models-{os.getpid()}.json"
+    try:
+        r = subprocess.run(
+            ["curl", "-sSL", "--max-time", "60",
+             "https://openrouter.ai/api/v1/models", "-o", str(tmp)],
+            capture_output=True, timeout=90,
+        )
+        if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size < 1000:
+            return False, "curl 下载模型列表失败"
+        sys.path.insert(0, str(radar.parent))
+        import radar as rmod  # noqa: E402
+        raw = json.loads(tmp.read_text(encoding="utf-8"))
+        entries = raw.get("data", [])
+        free = [m for m in entries if rmod.is_free(m)]
+        qualifying = [m for m in free if rmod.eligible(m)]
+        pending = [m for m in free
+                   if "tools" in (m.get("supported_parameters") or [])
+                   and rmod.billion(m) is None]
+        report = {
+            "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "eligible": [
+                {"id": m["id"], "context_length": m.get("context_length"),
+                 "parameters_b": rmod.billion(m)} for m in qualifying],
+            "needs_parameter_verification": [
+                {"id": m["id"], "context_length": m.get("context_length")}
+                for m in pending],
+            "free_ids": sorted(m["id"] for m in free),
+            "free_count": len(free),
+        }
+        rmod.atomic_json(rmod.CACHE, report)
+        return True, report
+    except Exception as e:  # noqa: BLE001
+        return False, f"兜底失败：{e}"
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def cmd_scan(_args) -> int:
+    """扫一遍免费模型池，刷新 settings.json 的 enabledModels（仍 fail-closed）。"""
+    print("正在扫描 OpenRouter 免费模型池…")
+    ok, report = _run_radar_scan()
+    if not ok:
+        print(f"主扫描失败（{report}），尝试兜底方案…")
+        ok, report = _fallback_scan()
+    if not ok:
+        print(f"❌ 扫描失败：{report}")
+        print("   请检查网络后重试：zw scan")
+        return 1
+    free_ids = [m for m in report.get("free_ids", []) if is_free_id(m)]
+    print(f"✅ 扫描完成：免费池 {report.get('free_count', len(free_ids))} 个模型")
+    # 用新池子刷新 enabledModels（只接受校验通过的 :free ID）
+    cur = read_settings()
+    if cur is None:
+        print("⚠️ settings.json 不存在，先跑：zw init")
+        return 0
+    try:
+        dm = check_default_model(cur.get("defaultModel", ""))
+    except FailClosedError as e:
+        print(f"⚠️ 当前 defaultModel 不合法（{e}），先跑：zw init")
+        return 0
+    if not free_ids:
+        print("⚠️ 扫描结果为空，不覆盖现有配置（fail-closed：不拿空池子授权）")
+        return 0
+    new_settings = build_settings(dm, free_ids)
+    atomic_write_json(settings_path(), new_settings)
+    os.chmod(settings_path(), 0o600)
+    print(f"✅ 已刷新白名单：{len(new_settings['enabledModels'])} 个免费模型")
+    if dm not in free_ids:
+        print(f"⚠️ 注意：当前默认模型 {dm} 已不在免费池中，建议 zw models 换一个")
+    return 0
+
+
+def cmd_models(args) -> int:
+    """列出免费模型；models use <id|序号> 切换默认模型。"""
+    ids, checked_at, excluded = read_scan_free_ids()
+    if not ids:
+        print("⚠️ 无扫描数据，先跑：zw scan")
+        ids = [DEFAULT_MODEL]
+        excluded = 0
+    else:
+        age = ""
+        if checked_at:
+            try:
+                dt_checked = dt.datetime.fromisoformat(checked_at)
+                hours = (dt.datetime.now(dt.timezone.utc) - dt_checked).total_seconds() / 3600
+                age = f"（{hours:.1f} 小时前扫描）"
+            except ValueError:
+                pass
+        print(f"免费模型池（共 {len(ids)} 个{age}）：")
+        if excluded:
+            print(f"  注：另有 {excluded} 个免费但无 :free 后缀的模型，"
+                  "fail-closed 策略下不列入可用名单。")
+    cur = read_settings()
+    cur_default = (cur or {}).get("defaultModel", "")
+    # context_length 速查
+    ctx = {}
+    try:
+        d = json.loads(scan_cache().read_text(encoding="utf-8"))
+        for item in d.get("needs_parameter_verification", []) + d.get("eligible", []):
+            ctx[item["id"]] = item.get("context_length")
+    except (OSError, ValueError, KeyError):
+        pass
+    if args.action == "use":
+        target = (args.target or "").strip()
+        # 支持序号
+        if target.isdigit():
+            idx = int(target) - 1
+            if 0 <= idx < len(ids):
+                target = ids[idx]
+            else:
+                print(f"❌ 序号超出范围（1-{len(ids)}）")
+                return 1
+        if not is_free_id(target):
+            print(f"❌ 拒绝：{target!r} 不是合法的 :free 模型 ID（fail-closed）")
+            return 1
+        if target not in ids:
+            print(f"❌ 拒绝：{target} 不在最新免费扫描结果中（fail-closed）")
+            print("   先跑 zw scan 刷新，或从列表里选。")
+            return 1
+        if cur is None:
+            print("⚠️ settings.json 不存在，先跑：zw init")
+            return 1
+        new_settings = build_settings(target, ids)
+        atomic_write_json(settings_path(), new_settings)
+        os.chmod(settings_path(), 0o600)
+        print(f"✅ 默认模型已切换为：{target}")
+        return 0
+    # 列表模式
+    for i, mid in enumerate(ids, 1):
+        mark = " ← 当前默认" if mid == cur_default else ""
+        cl = ctx.get(mid)
+        extra = f"  [上下文 {cl}]" if cl else ""
+        print(f"  {i:>3}. {mid}{extra}{mark}")
+    print()
+    print("切换：zw models use <序号或完整ID>")
+    return 0
+
+
+def _check(name, ok, hint=""):
+    icon = "✅" if ok is True else ("⚠️" if ok == "warn" else "❌")
+    print(f"{icon} {name}")
+    if hint and ok is not True:
+        print(f"   → {hint}")
+
+
+def cmd_doctor(_args) -> int:
+    """中文体检：逐项检查并给出修复提示。返回 0=全过，1=有失败项。"""
+    print("zw 体检报告")
+    print("=" * 40)
+    failed = False
+
+    # 1. Python
+    py_ok = sys.version_info >= (3, 10)
+    _check(f"Python {sys.version.split()[0]}（需要 ≥3.10）", py_ok,
+           "请安装 Python 3.10+：https://www.python.org/downloads/")
+    failed |= not py_ok
+
+    # 2. Node
+    node = shutil.which("node")
+    _check("Node.js", True if node else "warn",
+           "Pi 部分功能需要 Node；安装：https://nodejs.org/（LTS 版）" if not node else "")
+
+    # 3. pi
+    pi_bin = shutil.which("pi") or str(pi_agent() / "bin" / "pi")
+    pi_ok = os.path.isfile(pi_bin) and os.access(pi_bin, os.X_OK)
+    _check("Pi agent", pi_ok,
+           "安装：curl -fsSL https://pi.dev/install.sh | sh")
+    failed |= not pi_ok
+
+    # 4. Key 文件
+    kf = key_file()
+    key_ok, key_hint = False, ""
+    if not kf.exists():
+        key_hint = "重新运行 install.sh，或手动写入后执行 chmod 600 ~/.config/zw/.openrouter_key"
+    else:
+        try:
+            mode = stat.S_IMODE(os.stat(kf).st_mode)
+            size = kf.stat().st_size
+            if mode & 0o077:
+                key_hint = f"权限过松（{oct(mode)}），执行：chmod 600 {kf}"
+            elif size < 20:
+                key_hint = "文件内容过短，可能不是有效 Key"
+            else:
+                key_ok = True
+        except OSError as e:
+            key_hint = f"无法读取：{e}"
+    _check("OpenRouter Key（~/.config/zw/.openrouter_key，600 权限）", key_ok, key_hint)
+    failed |= not key_ok
+
+    # 5. auth.json
+    ap = auth_path()
+    auth_ok, auth_hint = False, ""
+    if not ap.exists():
+        auth_hint = "运行：zw init"
+    else:
+        try:
+            d = json.loads(ap.read_text(encoding="utf-8"))
+            ref = d.get("openrouter", {}).get("key", "")
+            if "!cat" in ref and ".openrouter_key" in ref:
+                auth_ok = True
+            else:
+                auth_hint = "auth.json 未正确引用 key 文件，运行：zw init"
+        except (ValueError, OSError):
+            auth_hint = "auth.json 不是合法 JSON，运行：zw init"
+    _check("Pi auth.json（!cat 引用 key，不落地明文）", auth_ok, auth_hint)
+    failed |= not auth_ok
+
+    # 6. settings.json fail-closed 三检查
+    sp = settings_path()
+    s_ok, s_hint = False, ""
+    cur = read_settings()
+    if cur is None:
+        s_hint = "运行：zw init"
+    else:
+        try:
+            dm = check_default_model(cur.get("defaultModel", ""))
+            if cur.get("defaultProvider") != "openrouter":
+                s_hint = "defaultProvider 必须为 openrouter，运行：zw init"
+            else:
+                em = cur.get("enabledModels", [])
+                bad = [m for m in em
+                       if not (is_free_id(m) and m.startswith("openrouter/"))]
+                if not em:
+                    s_hint = "enabledModels 为空，运行：zw init"
+                elif bad:
+                    s_hint = f"enabledModels 含非免费项（{len(bad)} 个），运行：zw init"
+                else:
+                    s_ok = True
+        except FailClosedError as e:
+            s_hint = f"{e}；运行：zw init"
+    _check("Pi settings.json（fail-closed：仅 :free 模型）", s_ok, s_hint)
+    failed |= not s_ok
+
+    # 7. 扫描数据新鲜度
+    _ids, checked_at, _excluded = read_scan_free_ids()
+    fresh = False
+    if checked_at:
+        try:
+            dt_c = dt.datetime.fromisoformat(checked_at)
+            fresh = (dt.datetime.now(dt.timezone.utc) - dt_c) < dt.timedelta(hours=24)
+        except ValueError:
+            pass
+    _check("免费模型扫描数据（24h 内）", True if fresh else "warn",
+           "运行：zw scan" if not fresh else "")
+
+    # 8. PATH
+    zw_bin_dir = str(zw_home() / "bin")
+    in_path = zw_bin_dir in os.environ.get("PATH", "").split(os.pathsep)
+    _check("~/.zw/bin 在 PATH 中", True if in_path else "warn",
+           '执行：export PATH="$HOME/.zw/bin:$PATH"（或重开终端）' if not in_path else "")
+
+    print("=" * 40)
+    if failed:
+        print("❌ 有失败项，按上面提示修复后重跑：zw doctor")
+        return 1
+    print("✅ 全部通过，零成本工作流就绪")
+    return 0
+
+
+def cmd_chat(args) -> int:
+    """zw chat [问题]：无参数进交互，有参数一次性问答。"""
+    pi_bin = shutil.which("pi")
+    if not pi_bin:
+        cand = pi_agent() / "bin" / "pi"
+        if cand.is_file():
+            pi_bin = str(cand)
+    if not pi_bin:
+        print("❌ 找不到 pi 命令，请先安装：curl -fsSL https://pi.dev/install.sh | sh")
+        return 1
+    if args.prompt:
+        os.execv(pi_bin, [pi_bin, "-p", " ".join(args.prompt)])
+    else:
+        os.execv(pi_bin, [pi_bin])
+    return 0  # execv 不返回
+
+
+def cmd_update(_args) -> int:
+    """git pull 更新仓库。"""
+    repo = None
+    cf = install_conf()
+    if cf.exists():
+        for line in cf.read_text(encoding="utf-8").splitlines():
+            if line.startswith("REPO_DIR="):
+                repo = line.split("=", 1)[1].strip()
+    if not repo or not Path(repo, ".git").is_dir():
+        print("❌ 找不到 git 仓库目录")
+        print("   手动更新：cd <仓库目录> && git pull")
+        return 1
+    print(f"正在更新：{repo}")
+    r = subprocess.run(["git", "-C", repo, "pull", "--ff-only"],
+                       capture_output=True, text=True, timeout=120)
+    print(r.stdout.strip() or r.stderr.strip())
+    if r.returncode != 0:
+        print("❌ 更新失败（可能有本地未提交的修改），请手动处理")
+        return 1
+    print("✅ 已是最新")
+    return 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="zw",
+        description="零成本 AI 工作流一键包：免费模型跑 Agent，一分钱不花。",
+    )
+    ap.add_argument("--version", action="version", version=f"zw {VERSION}")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("chat", help="开聊：无参数进交互模式，有参数一次性问答")
+    p.add_argument("prompt", nargs="*", help="问题（省略则进入交互）")
+    p.set_defaults(fn=cmd_chat)
+
+    p = sub.add_parser("scan", help="扫描 OpenRouter 免费模型池并刷新白名单")
+    p.set_defaults(fn=cmd_scan)
+
+    p = sub.add_parser("models", help="列出免费模型 / 切换默认模型")
+    p.add_argument("action", nargs="?", choices=["use"], help="use：切换默认模型")
+    p.add_argument("target", nargs="?", help="序号或完整模型 ID")
+    p.set_defaults(fn=cmd_models)
+
+    p = sub.add_parser("doctor", help="中文体检：检查环境并给出修复提示")
+    p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("update", help="git pull 更新到最新版")
+    p.set_defaults(fn=cmd_update)
+
+    p = sub.add_parser("init", help="（内部）生成 Pi 的 auth.json + settings.json")
+    p.set_defaults(fn=cmd_init)
+
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        ap.print_help()
+        return 0
+    try:
+        return args.fn(args) or 0
+    except FailClosedError as e:
+        print(f"❌ fail-closed 拒绝：{e}")
+        return 1
+    except KeyboardInterrupt:
+        print("\n已取消")
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
