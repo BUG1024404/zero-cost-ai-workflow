@@ -1,0 +1,61 @@
+# 每日免费模型扫描（GitHub Actions 版）
+# 复用 limin112/min-skill 的 radar.py 过滤函数（is_free / eligible / billion），不重复造轮子。
+# /models 是公开接口，不用 key；curl 落盘后过滤（VM 上 urllib 读该接口会 IncompleteRead 截断）。
+# 报告写回 freetoken-scan/report.json；只扫列表不做 probe（probe 要 key，仍走本地）。
+name: freetoken-scan
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天 08:00 CST
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/freetoken-scan.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone min-skill (radar.py)
+        run: git clone --depth 1 https://github.com/limin112/min-skill.git /tmp/min-skill
+      - name: Download OpenRouter model list
+        run: curl -sSL --max-time 60 https://openrouter.ai/api/v1/models -o /tmp/models.json
+      - name: Build report with radar.py filters
+        run: |
+          python3 - <<'EOF'
+          import datetime as dt
+          import json
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, '/tmp/min-skill/skills/FreeToken-Bots/scripts')
+          from radar import atomic_json, billion, eligible, is_free
+          raw = json.loads(Path('/tmp/models.json').read_text())
+          entries = raw.get('data', [])
+          free = [m for m in entries if is_free(m)]
+          qualifying = [m for m in free if eligible(m)]
+          pending = [m for m in free if 'tools' in (m.get('supported_parameters') or []) and billion(m) is None]
+          report = {
+              'checked_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'eligible': [{'id': m['id'], 'context_length': m.get('context_length'), 'parameters_b': billion(m)} for m in qualifying],
+              'needs_parameter_verification': [{'id': m['id'], 'context_length': m.get('context_length')} for m in pending],
+              'free_ids': sorted(m['id'] for m in free),
+              'free_count': len(free),
+          }
+          atomic_json(Path('freetoken-scan/report.json'), report)
+          print(f"free={len(free)} eligible={len(qualifying)} pending={len(pending)}")
+          EOF
+      - name: Commit report if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add freetoken-scan/report.json
+          git diff --cached --quiet || git commit -m "chore: daily freetoken scan $(date -u +%F)"
+          git push
+      - name: Summary
+        run: |
+          echo "free=$(python3 -c "import json;print(json.load(open('freetoken-scan/report.json'))['free_count'])")" >> "$GITHUB_STEP_SUMMARY"
+          echo "eligible=$(python3 -c "import json;print(len(json.load(open('freetoken-scan/report.json'))['eligible']))")" >> "$GITHUB_STEP_SUMMARY"
