@@ -1,11 +1,7 @@
 {
-  "checked_at": "2026-11-27T06:32:42.254529+00:00",
+  "checked_at": "2026-11-28T06:07:26.995429+00:00",
   "eligible": [],
   "needs_parameter_verification": [
-    {
-      "id": "inclusionai/ling-3.2-flash:free",
-      "context_length": 1048576
-    },
     {
       "id": "baidu/ernie-5.5-flash-preview:free",
       "context_length": 1024000
@@ -57,7 +53,6 @@
     "google/gemma-4-31b-it:free",
     "google/lyria-3-clip-preview",
     "google/lyria-3-pro-preview",
-    "inclusionai/ling-3.2-flash:free",
     "liquid/lfm-3-1.7b:free",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -67,5 +62,5 @@
     "particle-ai/particle-1:free",
     "recursive/flint-v1.0:free"
   ],
-  "free_count": 14
+  "free_count": 13
 }
